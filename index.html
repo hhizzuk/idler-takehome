@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cube</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #ffffff; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(() => {
+  const canvas = document.getElementById('c');
+  const gl = canvas.getContext('webgl2', { antialias: true, alpha: false });
+  if (!gl) { document.body.textContent = 'WebGL2 not supported'; return; }
+
+  // ---- math (column-major 4x4) ----
+  const ortho = (halfH, aspect, near, far) => {
+    const nf = 1 / (near - far);
+    return new Float32Array([1 / (halfH * aspect),0,0,0, 0,1 / halfH,0,0, 0,0,2 * nf,0, 0,0,(far + near) * nf,1]);
+  };
+  const translate = (x, y, z) => new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, x,y,z,1]);
+  const rotX = a => { const c = Math.cos(a), s = Math.sin(a); return new Float32Array([1,0,0,0, 0,c,s,0, 0,-s,c,0, 0,0,0,1]); };
+  const rotY = a => { const c = Math.cos(a), s = Math.sin(a); return new Float32Array([c,0,-s,0, 0,1,0,0, s,0,c,0, 0,0,0,1]); };
+  const mul = (a, b) => {
+    const o = new Float32Array(16);
+    for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) {
+      let s = 0;
+      for (let k = 0; k < 4; k++) s += a[k * 4 + r] * b[c * 4 + k];
+      o[c * 4 + r] = s;
+    }
+    return o;
+  };
+
+  // ---- shaders ----
+  const VS = `#version 300 es
+  in vec3 aPos; in vec2 aUV; in float aFace;
+  uniform mat4 uModel, uView, uProj, uGroup;
+  uniform vec3 uOffset; uniform float uScale;
+  out vec3 vLocal; out vec2 vUV; flat out int vFace;
+  void main() {
+    vec4 w = uModel * uGroup * vec4(aPos * uScale + uOffset, 1.0);
+    vLocal = aPos;
+    vUV = aUV;
+    vFace = int(aFace + 0.5);
+    gl_Position = uProj * uView * w;
+  }`;
+  const FS = `#version 300 es
+  precision highp float;
+  in vec3 vLocal; in vec2 vUV; flat in int vFace;
+  uniform vec3 uColor, uColA, uColB, uGradDir;
+  uniform int uShapes[6];
+  out vec4 outColor;
+  // signed distance (cell units), p centred in cell [-.5,.5]
+  // 0 solid circle, 1 circle with empty circle inside, 2 solid triangle,
+  // 3 solid square, 4 square with empty circle inside
+  float shapeSDF(vec2 p, int t) {
+    const float R = 0.41, HOLE = 0.15, TRI = 0.47, SQ = 0.35;   // big, solid, but floating with a clear gap
+    if (t == 0) return length(p) - R;
+    if (t == 1) return max(length(p) - R, HOLE - length(p));
+    if (t == 2) { p.y += TRI * 0.25; return max(abs(p.x) * 0.866 + p.y * 0.5, -p.y) - TRI * 0.5; }
+    float sq = max(abs(p.x), abs(p.y)) - SQ;
+    if (t == 3) return sq;
+    return max(sq, HOLE - length(p));
+  }
+  void main() {
+    vec2 cell = vUV * 7.0;
+    vec2 p = fract(cell) - 0.5;
+    float aa = fwidth(cell.x);
+    float m = 1.0 - smoothstep(-aa, aa, shapeSDF(p, uShapes[vFace]));
+    // flat, unlit: per-section gradient evaluated in the section's local space
+    float g = smoothstep(0.1, 0.9, 0.5 + dot(vLocal, uGradDir));
+    vec3 col = mix(uColor, mix(uColA, uColB, g), m);
+    outColor = vec4(col, 1.0);
+  }`;
+  const compile = (type, src) => {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+    return s;
+  };
+  const prog = gl.createProgram();
+  gl.attachShader(prog, compile(gl.VERTEX_SHADER, VS));
+  gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FS));
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+  gl.useProgram(prog);
+  const U = n => gl.getUniformLocation(prog, n);
+  const uModel = U('uModel'), uView = U('uView'), uProj = U('uProj');
+
+  // ---- geometry: unit cube, per-face UVs and face index ----
+  const faces = [
+    [[0,0,1],  [-1,-1,1],[1,-1,1],[1,1,1],[-1,1,1]],
+    [[0,0,-1], [1,-1,-1],[-1,-1,-1],[-1,1,-1],[1,1,-1]],
+    [[1,0,0],  [1,-1,1],[1,-1,-1],[1,1,-1],[1,1,1]],
+    [[-1,0,0], [-1,-1,-1],[-1,-1,1],[-1,1,1],[-1,1,-1]],
+    [[0,1,0],  [-1,1,1],[1,1,1],[1,1,-1],[-1,1,-1]],
+    [[0,-1,0], [-1,-1,-1],[1,-1,-1],[1,-1,1],[-1,-1,1]],
+  ];
+  const verts = [], idx = [];
+  faces.forEach((f, i) => {
+    const uvs = [[0,0],[1,0],[1,1],[0,1]];
+    for (let k = 1; k <= 4; k++) verts.push(...f[k].map(x => x * 0.5), ...f[0], ...uvs[k - 1], i);
+    const b = i * 4;
+    idx.push(b, b + 1, b + 2, b, b + 2, b + 3);
+  });
+  const vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  const vbo = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(verts), gl.STATIC_DRAW);
+  const ibo = gl.createBuffer();
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(idx), gl.STATIC_DRAW);
+  const aPos = gl.getAttribLocation(prog, 'aPos');
+  gl.enableVertexAttribArray(aPos);    gl.vertexAttribPointer(aPos, 3, gl.FLOAT, false, 36, 0);
+  const aUV = gl.getAttribLocation(prog, 'aUV');
+  gl.enableVertexAttribArray(aUV);     gl.vertexAttribPointer(aUV, 2, gl.FLOAT, false, 36, 24);
+  const aFace = gl.getAttribLocation(prog, 'aFace');
+  gl.enableVertexAttribArray(aFace);   gl.vertexAttribPointer(aFace, 1, gl.FLOAT, false, 36, 32);
+
+  // ---- camera / light ----
+  const camPos = [0, 0, 12];
+  const view = translate(-camPos[0], -camPos[1], -camPos[2]);
+  gl.uniform3fv(U('uColor'), [1, 1, 1]);
+  gl.uniformMatrix4fv(uView, false, view);
+
+  gl.enable(gl.DEPTH_TEST);
+  gl.enable(gl.CULL_FACE);
+  gl.clearColor(1, 1, 1, 1);
+
+  // ---- structure: N^3 sections, flush (no gaps) ----
+  const N = 3, PITCH = 1.0, PIECE = 1.0;
+  const uColA = U('uColA'), uColB = U('uColB'), uGradDir = U('uGradDir'), uGroup = U('uGroup'), uShapes = U('uShapes'), uOffset = U('uOffset'), uScale = U('uScale');
+  gl.uniform1f(uScale, PIECE);
+  const offsets = [];
+  let seed = 7;
+  const rand = () => (seed = (seed * 1664525 + 1013904223) % 4294967296) / 4294967296;
+  // two-hue palettes (A -> B) plus muted pink-brown ones
+  const PALETTES = [
+    [[0.00, 0.85, 1.00], [0.62, 1.00, 0.10]],  // cyan -> lime
+    [[1.00, 0.88, 0.10], [0.00, 0.72, 0.62]],  // yellow -> teal
+    [[0.00, 0.72, 0.68], [0.20, 0.88, 0.30]],  // teal -> green
+    [[1.00, 0.10, 0.70], [1.00, 0.55, 0.08]],  // magenta -> orange
+    [[0.62, 0.20, 0.92], [0.18, 0.42, 1.00]],  // purple -> blue
+    [[1.00, 0.16, 0.16], [1.00, 0.55, 0.08]],  // red -> orange
+    [[1.00, 0.42, 0.04], [1.00, 0.78, 0.14]],  // orange -> amber
+    [[0.96, 0.10, 0.34], [1.00, 0.40, 0.12]],  // crimson -> orange
+    [[0.14, 0.46, 1.00], [0.00, 0.80, 0.86]],  // blue -> cyan
+  ];
+  const MUTED = [
+    [[0.76, 0.52, 0.54], [0.56, 0.38, 0.34]],
+    [[0.82, 0.60, 0.58], [0.62, 0.44, 0.40]],
+  ];
+  // solid shapes dominate; ring / holed-square outlines are only occasional
+  const SHAPE_W = [0.30, 0.07, 0.30, 0.26, 0.07];   // circle, ring, triangle, square, holed square
+  const pickShape = () => { let r = rand(), k = 0; while (k < 4 && r >= SHAPE_W[k]) r -= SHAPE_W[k++]; return k; };
+  const c0 = (N - 1) / 2;
+  for (let x = 0; x < N; x++) for (let y = 0; y < N; y++) for (let z = 0; z < N; z++)
+    offsets.push({ idx: offsets.length, pos: [(x - c0) * PITCH, (y - c0) * PITCH, (z - c0) * PITCH], shapes: Array.from({ length: 6 }, () => pickShape()) });
+  // each section gets its own palette; sections that touch never share one (muted pink-browns stay rare)
+  const ALL = PALETTES.concat(MUTED);
+  const touching = (a, b) => Math.abs(a.pos[0] - b.pos[0]) + Math.abs(a.pos[1] - b.pos[1]) + Math.abs(a.pos[2] - b.pos[2]) < PITCH * 1.01;
+  let mutedUsed = 0;
+  for (const o of offsets) {
+    const taken = new Set(offsets.filter(q => q.pal !== undefined && touching(o, q)).map(q => q.pal));
+    const opts = ALL.map((_, i) => i).filter(i => !taken.has(i) && (i < PALETTES.length || mutedUsed < 3));
+    const w = opts.map(i => (i < PALETTES.length ? 1 : 0.35));
+    let r = rand() * w.reduce((a, b) => a + b, 0), k = 0;
+    while (k < opts.length - 1 && r >= w[k]) r -= w[k++];
+    o.pal = opts[k];
+    if (o.pal >= PALETTES.length) mutedUsed++;
+    const pal = ALL[o.pal];
+    o.colA = pal[0]; o.colB = pal[1];
+    // gradient axis fixed in the section's local space (moves with it): a body diagonal with
+    // random signs, so every face sees a full-strength diagonal sweep from colour A to colour B
+    const sg = k => (Math.sin(o.idx * (k + 1.7) + k) > 0 ? 0.5 : -0.5);
+    o.dir = [sg(0), sg(1), sg(2)];
+  }
+  // static 3/4 view: yaw to show front + side, pitch down to show top
+  const model = mul(rotX(Math.atan(1 / Math.SQRT2)), rotY(-Math.PI / 4)); // true isometric
+
+  // ---- resize + loop ----
+  let proj;
+  const resize = () => {
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const w = Math.floor(innerWidth * dpr), h = Math.floor(innerHeight * dpr);
+    canvas.width = w; canvas.height = h;
+    gl.viewport(0, 0, w, h);
+    proj = ortho(3.4, w / h, 0.1, 100);
+    gl.uniformMatrix4fv(uProj, false, proj);
+  };
+  addEventListener('resize', resize);
+  resize();
+
+  // ---- move scheduling ----
+  // A move = { axis: 'x'|'y'|'z', layer: -1|0|1 (grid index along axis), dir: +1|-1 (right-hand rule about +axis) }.
+  // A step plays several moves at once; each move may have its own start delay but always takes T_MOVE.
+  // Moves inside one step must be on the same axis (different axes share sections).
+  // Each section keeps a rotation M (all committed moves); its current cell is M * home position.
+  // A move rotates its slice as one group, then is baked into M when it finishes, so later moves
+  // select their sections from the updated cube state.
+  const T_START = 1.0, T_MOVE = 2.0, T_PAUSE = 0.6;
+  const timeline = [];
+  let cursor = T_START;
+  const step = (moves, pauseAfter = T_PAUSE) => {
+    let span = 0;
+    for (const m of moves) {
+      const dur = m.dur || T_MOVE;
+      timeline.push({ axis: m.axis, layer: m.layer, dir: m.dir, dur, turn: m.turn || Math.PI / 2, ease: m.ease || easeInOutCubic, start: cursor + (m.delay || 0), done: false });
+      span = Math.max(span, (m.delay || 0) + dur);
+    }
+    cursor += span + pauseAfter;
+  };
+  const AX = { x: 0, y: 1, z: 2 };
+  const rotZ = a => { const c = Math.cos(a), s = Math.sin(a); return new Float32Array([c,s,0,0, -s,c,0,0, 0,0,1,0, 0,0,0,1]); };
+  // rotation about the (1,1,1) cube diagonal (the corner facing the camera), Rodrigues
+  const rotDiag = a => {
+    const c = Math.cos(a), s = Math.sin(a), k = 1 - c, u = 1 / Math.sqrt(3), w = s * u, d = c + k / 3, e = k / 3;
+    return new Float32Array([d,e+w,e-w,0, e-w,d,e+w,0, e+w,e-w,d,0, 0,0,0,1]);
+  };
+  const rotAxis = (axis, a) => axis === 'x' ? rotX(a) : axis === 'y' ? rotY(a) : axis === 'z' ? rotZ(a) : rotDiag(a);
+  // Keep the twist inside the cube's hexagonal silhouette (the cube seen along the swirl axis).
+  // The inner layer stays inside under any rotation. The outer layer's corners would swing past the
+  // hexagon's edges, so it is scaled toward the centre just enough for its current angle; the middle
+  // layer only grazes the edges, so it gets a slight dip. Both are exactly 1 at the start and end.
+  const HALF = (PIECE / 2 + 1) * PITCH;                       // half-extent of the assembled cube
+  const HEX_IN = HALF * Math.SQRT2, OUTER_R = HEX_IN / Math.cos(Math.PI / 6);  // hexagon inradius, vertex radius
+  const fitScale = (layer, theta, turn) => {
+    let f = 1;
+    if (layer === 2) {
+      let phi = Math.abs(theta) % (Math.PI / 3);              // angle from the nearest hexagon vertex
+      phi = Math.min(phi, Math.PI / 3 - phi);
+      f = Math.min(1, HEX_IN / (OUTER_R * Math.cos(Math.PI / 6 - phi))) * (1 - 0.02 * Math.sin(3 * phi));
+    } else if (layer === 1) {
+      f = 1 - 0.07 * Math.sin(Math.PI * Math.abs(theta) / turn);
+    }
+    return new Float32Array([f,0,0,0, 0,f,0,0, 0,0,f,0, 0,0,0,1]);
+  };
+  // twist layers by distance from the diagonal: 0 inner (on-axis + adjacent), 1 middle, 2 outer
+  const twistLayer = c => { const sum = c[0] + c[1] + c[2], d3 = 3 * (c[0]*c[0] + c[1]*c[1] + c[2]*c[2]) - sum * sum; return d3 <= 2 ? 0 : d3 <= 6 ? 1 : 2; };
+  const easeInOutCubic = u => u < 0.5 ? 4 * u * u * u : 1 - Math.pow(-2 * u + 2, 3) / 2;
+  const IDENT = new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]);
+  for (const o of offsets) o.M = IDENT;
+  const cellOf = o => {  // current integer grid cell of a section
+    const m = o.M, [x, y, z] = o.pos;
+    return [m[0]*x + m[4]*y + m[8]*z, m[1]*x + m[5]*y + m[9]*z, m[2]*x + m[6]*y + m[10]*z].map(v => Math.round(v / PITCH));
+  };
+  const inSlice = (o, mv) => mv.axis === 'd' ? twistLayer(cellOf(o)) === mv.layer : cellOf(o)[AX[mv.axis]] === mv.layer;
+  const snap = m => m.map(v => Math.round(v * 1e4) / 1e4);  // keep rotations exact after baking
+  // largest distance of any section's centre from an integer grid cell, or of any orientation entry from 0/+-1
+  const gridDeviation = () => Math.max(...offsets.map(o => {
+    const m = o.M, [x, y, z] = o.pos;
+    const c = [m[0]*x + m[4]*y + m[8]*z, m[1]*x + m[5]*y + m[9]*z, m[2]*x + m[6]*y + m[10]*z];
+    return Math.max(...c.map(v => Math.abs(v / PITCH - Math.round(v / PITCH))), ...o.M.map(v => Math.abs(v - Math.round(v))));
+  }));
+  window.cubeGridDeviation = gridDeviation;   // for tests
+  const commit = mv => {
+    const R = rotAxis(mv.axis, mv.dir * mv.turn);
+    for (const o of offsets) if (inSlice(o, mv)) o.M = snap(mul(R, o.M));
+    const dev = gridDeviation();
+    if (dev > 1e-6) console.error('cube is off-grid after move', mv, 'deviation', dev);
+  };
+
+  // ---- endless random loop: 1-layer, 2-layer, 3-layer, 1-layer, 2-layer, twist, repeat ----
+  // Every choice is random each time. Which sections move is decided at run time from the cube's
+  // current state (cellOf), so the right pieces move no matter what happened before.
+  const pick = arr => arr[Math.floor(Math.random() * arr.length)];
+  const randAxis = () => pick(['x', 'y', 'z']);
+  const randDir = () => (Math.random() < 0.5 ? 1 : -1);
+  const LAYERS = [-1, 0, 1];
+  const oneLayer = () => step([{ axis: randAxis(), layer: pick(LAYERS), dir: randDir() }], 0.4);
+  const twoLayer = () => {                      // two layers on one axis, opposite directions
+    const axis = randAxis(), dir = randDir(), skip = pick(LAYERS), two = LAYERS.filter(l => l !== skip);
+    step([{ axis, layer: two[0], dir }, { axis, layer: two[1], dir: -dir }]);
+  };
+  const threeLayer = () => {                    // all three layers on one axis, same direction, staggered
+    const axis = randAxis(), dir = randDir();
+    step(LAYERS.map((layer, k) => ({ axis, layer, dir, delay: 0.3 * k })));
+  };
+  // twist: whole cube swirls 120deg about the corner facing the camera, staying inside the hexagon.
+  // The outer layer creeps first and swings round only late; middle (opposite way) and inner join at 0.25s.
+  const TWIST = 2 * Math.PI / 3;
+  const easeLate = u => 0.06 * u + 0.94 * easeInOutCubic(Math.min(Math.max((u - 0.6) / 0.4, 0), 1));
+  const twist = () => step([
+    { axis: 'd', layer: 2, dir: 1,  turn: TWIST, delay: 0,    dur: 1.0, ease: easeLate },
+    { axis: 'd', layer: 1, dir: -1, turn: TWIST, delay: 0.25, dur: 0.75 },
+    { axis: 'd', layer: 0, dir: 1,  turn: TWIST, delay: 0.25, dur: 0.75 }], 1.0);
+  const cycle = () => { oneLayer(); twoLayer(); threeLayer(); oneLayer(); twoLayer(); twist(); };
+  const LOOKAHEAD = 4;  // seconds of schedule kept ready
+
+  const t0 = performance.now();
+  const frame = now => {
+    const t = (now - t0) / 1000;
+    while (cursor < t + LOOKAHEAD) cycle();
+    const progress = mv => (t - mv.start) / mv.dur;
+    for (const mv of timeline) if (!mv.done && progress(mv) >= 1) { commit(mv); mv.done = true; }  // chronological
+    for (let k = timeline.length - 1; k >= 0; k--) if (timeline[k].done) timeline.splice(k, 1);  // drop finished moves
+    const active = timeline.filter(mv => !mv.done && progress(mv) > 0)
+      .map(mv => {
+        const theta = mv.dir * mv.turn * mv.ease(progress(mv));
+        const R = rotAxis(mv.axis, theta);
+        return { mv, R: mv.axis === 'd' && mv.layer > 0 ? mul(fitScale(mv.layer, theta, mv.turn), R) : R };
+      });
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    gl.uniformMatrix4fv(uModel, false, model);
+    for (const o of offsets) {
+      const a = active.find(a => inSlice(o, a.mv));
+      gl.uniformMatrix4fv(uGroup, false, a ? mul(a.R, o.M) : o.M);
+      gl.uniform3fv(uOffset, o.pos);
+      gl.uniform1iv(uShapes, o.shapes);
+      gl.uniform3fv(uColA, o.colA); gl.uniform3fv(uColB, o.colB); gl.uniform3fv(uGradDir, o.dir);
+      gl.drawElements(gl.TRIANGLES, idx.length, gl.UNSIGNED_SHORT, 0);
+    }
+    requestAnimationFrame(frame);
+  };
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
